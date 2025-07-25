@@ -60,7 +60,7 @@ python3 leverage_drip_income.py --ticker QYLD --start_date 2014-01-01 --leverage
 ### Advanced Usage with Income Generation
 
 ```bash
-python3 leverage_drip_income.py \
+python leverage_drip_income.py \
     --ticker SCHD \
     --start_date 2012-01-01 \
     --end_date 2024-01-01 \
@@ -154,7 +154,7 @@ python3 leverage_drip_income.py \
 
 ### Conservative Income Strategy
 ```bash
-python3 leverage_drip_income.py \
+python leverage_drip_income.py \
     --ticker VYM \
     --leverage_ratio 1.3 \
     --income_withdrawal_rate 0.9 \
@@ -164,7 +164,7 @@ python3 leverage_drip_income.py \
 
 ### Aggressive Growth Strategy
 ```bash
-python3 leverage_drip_income.py \
+python leverage_drip_income.py \
     --ticker JEPI \
     --leverage_ratio 2.5 \
     --income_withdrawal_rate 0.1 \
@@ -174,7 +174,7 @@ python3 leverage_drip_income.py \
 
 ### Risk Assessment Mode
 ```bash
-python3 leverage_drip_income.py \
+python leverage_drip_income.py \
     --ticker QYLD \
     --leverage_ratio 3.0 \
     --margin_requirement 0.30 \
