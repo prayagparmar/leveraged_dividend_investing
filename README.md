@@ -41,14 +41,6 @@ pip install yfinance pandas numpy matplotlib
 - `argparse` - Command-line argument parsing (built-in)
 - `warnings` - Warning management (built-in)
 
-## Required Data Files
-
-**FEDFUNDS.csv**: Federal Funds Rate data from the Federal Reserve Economic Data (FRED)
-- Download from: https://fred.stlouisfed.org/series/FEDFUNDS
-- Format: CSV with columns `observation_date` and `FEDFUNDS`
-- Place in the same directory as the script
-- If missing, the script will use a default 2% rate with a warning
-
 ## Usage
 
 ### Basic Usage
