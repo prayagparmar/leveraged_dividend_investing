@@ -73,7 +73,8 @@ class StrictLeverageDripStrategy:
                  wind_down_rate: float = 1.0, tax_rate: float = 0.20,
                  pay_interest_from_dividends: bool = True,
                  income_withdrawal_rate: float = 0.0,
-                 income_hold_off_years: float = 0.0):
+                 income_hold_off_years: float = 0.0,
+                 dca_amount: float = 0.0):
         self.ticker = ticker
         self.start_date = start_date
         self.end_date = end_date or datetime.now().strftime('%Y-%m-%d')
@@ -87,6 +88,7 @@ class StrictLeverageDripStrategy:
         self.pay_interest_from_dividends = pay_interest_from_dividends
         self.income_withdrawal_rate = income_withdrawal_rate
         self.income_hold_off_years = income_hold_off_years
+        self.dca_amount = dca_amount
 
         # Validate tax rate
         if not (0.0 <= tax_rate <= 1.0):
@@ -99,6 +101,9 @@ class StrictLeverageDripStrategy:
         # Validate income hold-off years
         if income_hold_off_years < 0.0:
             raise ValueError("income_hold_off_years must be non-negative")
+
+        if self.dca_amount < 0.0:
+            raise ValueError("dca_amount must be non-negative")
 
     def fetch_data(self) -> Tuple[pd.DataFrame, pd.Series]:
         try:
@@ -248,10 +253,62 @@ class StrictLeverageDripStrategy:
 
         return shares_held, loan_balance, margin_call_occurred, amount_sold
 
+    def _reinvest_cash(self, price: float, shares_held: float, loan_balance: float,
+                   cash_to_invest: float, wind_down_triggered: bool) -> Tuple[float, float, bool, float]:
+        leverage_used = False
+        loan_repayment_from_cash = 0
+
+        if cash_to_invest <= 0:
+            return shares_held, loan_balance, leverage_used, loan_repayment_from_cash
+
+        if wind_down_triggered:
+            if loan_balance > 0:
+                loan_repayment_from_cash = cash_to_invest * self.wind_down_rate
+                cash_to_invest -= loan_repayment_from_cash
+                loan_balance = max(0, loan_balance - loan_repayment_from_cash)
+
+            if cash_to_invest > 0:
+                additional_shares = cash_to_invest / price
+                shares_held += additional_shares
+        else:
+            portfolio_value = shares_held * price
+            equity = portfolio_value - loan_balance
+
+            if equity <= 0:
+                additional_shares = cash_to_invest / price
+                shares_held += additional_shares
+                return shares_held, loan_balance, False, 0
+
+            current_leverage = portfolio_value / equity if equity > 0 else float('inf')
+
+            if current_leverage < self.target_leverage:
+                target_portfolio_value = equity * self.target_leverage
+                investment_needed = target_portfolio_value - portfolio_value
+
+                max_possible_portfolio_value = equity / self.margin_requirement
+                max_possible_borrow = max_possible_portfolio_value - portfolio_value
+                max_possible_borrow = max(0, max_possible_borrow)
+
+                leverage_portion = min(investment_needed, max_possible_borrow)
+                leverage_portion = max(0, leverage_portion)
+
+                total_investment = cash_to_invest + leverage_portion
+                additional_shares = total_investment / price
+
+                shares_held += additional_shares
+                loan_balance += leverage_portion
+
+                if leverage_portion > 0:
+                    leverage_used = True
+            else:
+                additional_shares = cash_to_invest / price
+                shares_held += additional_shares
+
+        return shares_held, loan_balance, leverage_used, loan_repayment_from_cash
+
     def _handle_dividend(self, price: float, shares_held: float, loan_balance: float,
                          dividend_per_share: float, wind_down_triggered: bool,
-                         accrued_interest: float, current_date: pd.Timestamp, 
-                         start_date: pd.Timestamp) -> Tuple[float, float, float, float, float, float, float, float, bool]:
+                         accrued_interest: float, in_income_phase: bool) -> Tuple[float, float, float, float, float, float, float, float, bool]:
         # Calculate gross dividend
         gross_dividend = dividend_per_share * shares_held
 
@@ -269,66 +326,15 @@ class StrictLeverageDripStrategy:
             remaining_dividend -= interest_payment
             accrued_interest -= interest_payment
 
-        # Determine if we're in hold-off period
-        days_elapsed = (current_date - start_date).days
-        years_elapsed = days_elapsed / 365.25
-        effective_withdrawal_rate = 0.0 if years_elapsed < self.income_hold_off_years else self.income_withdrawal_rate
-
         # Income withdrawal - take specified percentage from what's left after interest
+        effective_withdrawal_rate = self.income_withdrawal_rate if in_income_phase else 0.0
         income_withdrawal = remaining_dividend * effective_withdrawal_rate
         remaining_dividend -= income_withdrawal
 
-        loan_repayment_today = 0
-        leverage_used = False
-
-        if wind_down_triggered:
-            # During wind-down, prioritize loan repayment if loan exists
-            if remaining_dividend > 0 and loan_balance > 0:
-                loan_repayment_today = remaining_dividend * self.wind_down_rate
-                remaining_dividend -= loan_repayment_today
-                loan_balance = max(0, loan_balance - loan_repayment_today)
-
-            # Any remaining dividend gets reinvested without leverage (no borrowing during wind-down)
-            if remaining_dividend > 0:
-                additional_shares = remaining_dividend / price
-                shares_held += additional_shares
-        else:
-            # NEW: Strict leverage maintenance during dividend reinvestment
-            if remaining_dividend > 0:
-                portfolio_value = shares_held * price
-                equity = portfolio_value - loan_balance
-
-                # Calculate current leverage
-                current_leverage = portfolio_value / equity
-
-                # Calculate target portfolio value for 1.5X leverage
-                target_portfolio_value = equity * self.target_leverage
-
-                # Determine how much to invest with leverage
-                investment_needed = target_portfolio_value - portfolio_value
-
-                # Calculate maximum possible borrowing
-                max_possible_borrow = (equity / self.margin_requirement) - portfolio_value
-                max_possible_borrow = max(0, max_possible_borrow)
-
-                if current_leverage < self.target_leverage and investment_needed > 0:
-                    # Portfolio has appreciated - use higher margin
-                    leverage_portion = min(investment_needed, max_possible_borrow)
-
-                    # Total investment = dividend + borrowed funds
-                    total_reinvestment = remaining_dividend + leverage_portion
-                    additional_shares = total_reinvestment / price
-
-                    shares_held += additional_shares
-                    loan_balance += leverage_portion
-                    
-                    # Flag leverage usage if we actually borrowed money
-                    if leverage_portion > 0:
-                        leverage_used = True
-                else:
-                    # Portfolio has depreciated - only use dividend
-                    additional_shares = remaining_dividend / price
-                    shares_held += additional_shares
+        # Reinvest the remaining dividend using the new centralized method
+        shares_held, loan_balance, leverage_used, loan_repayment_today = self._reinvest_cash(
+            price, shares_held, loan_balance, remaining_dividend, wind_down_triggered
+        )
 
         return shares_held, loan_balance, gross_dividend, loan_repayment_today, interest_payment, accrued_interest, dividend_tax, income_withdrawal, leverage_used
 
@@ -336,7 +342,7 @@ class StrictLeverageDripStrategy:
                                 loan_balance: float, current_leverage: float, dividend_today: float,
                                 gap_interest: float, wind_down_triggered: bool, loan_repayment_today: float,
                                 margin_call_occurred: bool, margin_call_amount: float, dividend_tax_today: float,
-                                income_withdrawal_today: float):
+                                income_withdrawal_today: float, dca_investment_today: float):
         results['portfolio_values'].append(portfolio_value)
         results['equity_values'].append(equity)
         results['loan_balances'].append(loan_balance)
@@ -349,6 +355,7 @@ class StrictLeverageDripStrategy:
         results['margin_call_flags'].append(margin_call_occurred)
         results['margin_call_amounts'].append(margin_call_amount)
         results['income_withdrawals'].append(income_withdrawal_today)
+        results['dca_investments'].append(dca_investment_today)
 
     def _calculate_final_metrics(self, results: Dict, dates: pd.DatetimeIndex,
                                  shares_held: float, accrued_interest: float) -> Dict:
@@ -363,8 +370,11 @@ class StrictLeverageDripStrategy:
         equity_returns = np.diff(results['equity_values']) / np.array(results['equity_values'][:-1])
         equity_returns = equity_returns[np.isfinite(equity_returns)]
 
+        total_capital_contributed = self.initial_investment + results.get('total_dca_invested', 0)
+        results['total_capital_contributed'] = total_capital_contributed
+
         results['equity_cagr'] = self.calculate_cagr(
-            self.initial_investment, final_equity, years
+            total_capital_contributed, final_equity, years
         )
         results['portfolio_cagr'] = self.calculate_cagr(
             self.initial_investment * min(self.target_leverage, 1/self.margin_requirement),
@@ -547,14 +557,22 @@ class StrictLeverageDripStrategy:
             'leverage_ratios': [], 'dividend_payments': [], 'dividend_taxes_paid': [],
             'interest_costs': [], 'wind_down_status': [], 'loan_repayments': [],
             'margin_call_flags': [], 'margin_call_amounts': [], 'income_withdrawals': [],
-            'total_dividends': 0, 'total_dividend_taxes': 0, 'total_interest': 0,
-            'total_loan_repayments': 0, 'total_margin_calls': 0, 'total_margin_sales': 0,
-            'total_dividend_events': 0, 'dividend_events_no_leverage': 0, 'total_income_withdrawn': 0
+            'dca_investments': [], 'total_dividends': 0, 'total_dividend_taxes': 0,
+            'total_interest': 0, 'total_loan_repayments': 0, 'total_margin_calls': 0,
+            'total_margin_sales': 0, 'total_dividend_events': 0,
+            'dividend_events_no_leverage': 0, 'total_income_withdrawn': 0,
+            'total_dca_invested': 0
         }
         
         for i, (date, price) in enumerate(zip(dates, prices)):
             days_gap = self._calculate_gap_days(date.date(), prev_date)
             
+
+            # Determine if we're in the income phase
+            days_elapsed = (date - dates[0]).days
+            years_elapsed = days_elapsed / 365.25
+            in_income_phase = years_elapsed >= self.income_hold_off_years
+
             # Update benchmark performance
             benchmark_value = benchmark_shares * price
             if date in dividends.index:
@@ -624,7 +642,7 @@ class StrictLeverageDripStrategy:
                 if dividend_per_share > 0:  # Only process actual dividend payments
                     (shares_held, loan_balance, gross_dividend,
                      loan_repayment_today, interest_payment_from_dividend, accrued_interest, dividend_tax, income_withdrawal_today, leverage_used) = self._handle_dividend(
-                        price, shares_held, loan_balance, dividend_per_share, wind_down_triggered, accrued_interest, date, dates[0]
+                        price, shares_held, loan_balance, dividend_per_share, wind_down_triggered, accrued_interest, in_income_phase
                     )
 
                     results['total_dividends'] += gross_dividend
@@ -649,11 +667,22 @@ class StrictLeverageDripStrategy:
                     margin_call_occurred = margin_call_occurred or div_margin_call_occurred
                     margin_call_amount += div_margin_call_amount
 
+            dca_investment_today = 0
+            if self.dca_amount > 0 and not in_income_phase:
+                dca_investment_today = self.dca_amount
+                (shares_held, loan_balance, _,
+                 dca_loan_repayment) = self._reinvest_cash(
+                    price, shares_held, loan_balance, self.dca_amount, wind_down_triggered
+                )
+                results['total_dca_invested'] += self.dca_amount
+                results['total_loan_repayments'] += dca_loan_repayment
+
             current_leverage = (shares_held * price) / ((shares_held * price) - loan_balance) if ((shares_held * price) - loan_balance) > 0 else float('inf')
             self._update_tracking_arrays(
                 results, (shares_held * price), ((shares_held * price) - loan_balance), loan_balance, current_leverage,
                 dividend_today, gap_interest, wind_down_triggered, loan_repayment_today,
-                margin_call_occurred, margin_call_amount, dividend_tax_today, income_withdrawal_today
+                margin_call_occurred, margin_call_amount, dividend_tax_today, income_withdrawal_today,
+                dca_investment_today
             )
 
             prev_date = date
@@ -701,6 +730,10 @@ class StrictLeverageDripStrategy:
         print(f"Ticker: {self.ticker}")
         print(f"Period: {self.actual_start_date} to {self.actual_end_date}")
         print(f"Initial Investment: ${self.initial_investment:,.2f}")
+        if self.dca_amount > 0:
+            print(f"Daily DCA Amount: ${self.dca_amount:,.2f}")
+            print(f"Total DCA Invested: ${results['total_dca_invested']:,.2f}")
+            print(f"Total Capital Contributed: ${results['total_capital_contributed']:,.2f}")
         print(f"Target Leverage: {self.target_leverage:.1f}x")
         print(f"Interest Rate: Fed Rate + {self.broker_spread:.2%} (from FEDFUNDS.csv, charged monthly)")
         print(f"Margin Requirement: {self.margin_requirement:.0%} Equity (Maintenance)")
@@ -752,7 +785,7 @@ class StrictLeverageDripStrategy:
         print("INCOME WITHDRAWAL STATISTICS")
         print("-"*40)
         if self.income_hold_off_years > 0:
-            income_start_date = dates[0] + pd.DateOffset(years=self.income_hold_off_years)
+            income_start_date = dates[0] + pd.DateOffset(days=self.income_hold_off_years * 365.25)
             if income_start_date <= dates[-1]:
                 print(f"Income Phase Started: {income_start_date.strftime('%Y-%m-%d')} (after {self.income_hold_off_years:.1f} year hold-off)")
             else:
@@ -783,7 +816,10 @@ class StrictLeverageDripStrategy:
         print("\n" + "-"*40)
         print("PERFORMANCE METRICS")
         print("-"*40)
-        print(f"Equity CAGR: {results['equity_cagr']:.2f}%")
+        if self.dca_amount > 0:
+            print(f"Equity CAGR: {results['equity_cagr']:.2f}% (approximated with DCA contributions)")
+        else:
+            print(f"Equity CAGR: {results['equity_cagr']:.2f}%")
         print(f"Max Drawdown: {results['max_drawdown']:.2f}% (on {results['max_drawdown_date']})")
         print(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
         
@@ -874,7 +910,8 @@ class StrictLeverageDripStrategy:
         df_temp = pd.DataFrame({
             'income_withdrawals': results['income_withdrawals'],
             'dividend_payments': results['dividend_payments'],
-            'interest_costs': results['interest_costs']
+            'interest_costs': results['interest_costs'],
+            'dca_investments': results['dca_investments']
         }, index=dates)
         
         monthly_data = df_temp.resample('ME').sum()
@@ -882,6 +919,10 @@ class StrictLeverageDripStrategy:
         # Plot monthly income streams
         ax3.bar(monthly_data.index, monthly_data['income_withdrawals'], 
                 label='Monthly Income Withdrawn', color='darkgreen', alpha=0.8, width=20)
+        if self.dca_amount > 0:
+            ax3.bar(monthly_data.index, monthly_data['dca_investments'],
+                    label='Monthly DCA Investments', color='purple', alpha=0.8, width=20,
+                    bottom=monthly_data['income_withdrawals'])
         ax3.plot(monthly_data.index, monthly_data['dividend_payments'], 
                  label='Monthly Gross Dividends', color='green', linewidth=2, marker='o', markersize=4)
         ax3.plot(monthly_data.index, monthly_data['interest_costs'], 
@@ -898,7 +939,8 @@ class StrictLeverageDripStrategy:
         ax3.tick_params(axis='x', rotation=45)
 
         plt.tight_layout()
-        plt.show()
+        plt.savefig('performance_charts.png')
+        plt.close()
 
     def export_greeks_summary(self, results: Dict) -> pd.DataFrame:
         """Export Greeks summary as a DataFrame"""
@@ -960,6 +1002,7 @@ def main():
     parser.add_argument('--pay_interest_from_dividends', type=bool, default=True, help='Pay interest from dividends (True) or let it accumulate to margin (False)')
     parser.add_argument('--income_withdrawal_rate', type=float, default=0.5, help='Percentage of net dividends to withdraw as income (0.0 to 1.0)')
     parser.add_argument('--income_hold_off_years', type=float, default=20.0, help='Years to wait before taking income withdrawals (default: 0.0)')
+    parser.add_argument('--dca_amount', type=float, default=0.0, help='Daily DCA amount to invest')
     parser.add_argument('--plot', action='store_true', help='Show plots')
     parser.add_argument('--export_greeks', action='store_true', help='Export Greeks summary to CSV')
 
@@ -990,7 +1033,8 @@ def main():
         tax_rate=args.tax_rate,
         pay_interest_from_dividends=args.pay_interest_from_dividends,
         income_withdrawal_rate=args.income_withdrawal_rate,
-        income_hold_off_years=args.income_hold_off_years
+        income_hold_off_years=args.income_hold_off_years,
+        dca_amount=args.dca_amount
     )
 
     try:
